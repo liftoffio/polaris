@@ -80,6 +80,7 @@ dependencies {
   implementation(libs.microprofile.fault.tolerance.api)
 
   compileOnly(libs.jakarta.annotation.api)
+  compileOnly(libs.hive.metastore)
 
   implementation(platform(libs.google.cloud.storage.bom))
   implementation("com.google.cloud:google-cloud-storage")

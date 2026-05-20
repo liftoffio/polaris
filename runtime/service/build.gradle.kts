@@ -104,6 +104,7 @@ dependencies {
   implementation("com.azure:azure-storage-file-datalake")
 
   compileOnly(libs.swagger.annotations)
+  compileOnly(libs.hive.metastore)
 
   implementation(platform(libs.jackson.bom))
   implementation("com.fasterxml.jackson.core:jackson-annotations")

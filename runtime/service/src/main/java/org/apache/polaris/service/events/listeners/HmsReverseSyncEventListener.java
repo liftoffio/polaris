@@ -16,6 +16,7 @@
 package org.apache.polaris.service.events.listeners;
 
 import io.smallrye.common.annotation.Identifier;
+import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.util.ArrayList;
@@ -78,6 +79,21 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       defaultValue = "hms-sync")
   String ignorePrincipal;
 
+  // Propagate DROP TABLE events back to HMS. Default false: HMS is the source of
+  // truth; Polaris deletes (teardowns, POC experiments) must not remove HMS tables.
+  @Inject
+  @ConfigProperty(
+      name = "polaris.hms-reverse-sync.propagate-deletes",
+      defaultValue = "false")
+  boolean propagateDeletes;
+
+  @Inject
+  @ConfigProperty(name = "polaris.hms-reverse-sync.hms-timeout-ms", defaultValue = "5000")
+  int hmsTimeoutMs;
+
+  @Inject
+  Vertx vertx;
+
   // ── Event dispatch ───────────────────────────────────────────────────────
 
   @Override
@@ -96,7 +112,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterCreateTable: {}.{} @ {}", ns, tbl, loc);
-        syncToHms(ns, tbl, loc, false);
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false); return null; })
+            .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_REGISTER_TABLE -> {
         // registerTable is normally triggered by the HMS→Polaris forward sync;
@@ -110,7 +127,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterRegisterTable (non-echo): {}.{} @ {}", ns, tbl, loc);
-        syncToHms(ns, tbl, loc, false);
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false); return null; })
+            .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_UPDATE_TABLE -> {
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
@@ -122,13 +140,20 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterUpdateTable: {}.{} @ {}", ns, tbl, loc);
-        syncToHms(ns, tbl, loc, true);
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, true); return null; })
+            .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_DROP_TABLE -> {
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
         String tbl = event.attributes().getRequired(EventAttributes.TABLE_NAME);
+        if (!propagateDeletes) {
+          LOG.warn("Skipping HMS drop for {}.{} — propagate-deletes=false; "
+              + "set polaris.hms-reverse-sync.propagate-deletes=true to enable", ns, tbl);
+          return;
+        }
         LOG.info("onAfterDropTable: {}.{}", ns, tbl);
-        dropFromHms(ns, tbl);
+        vertx.executeBlocking(() -> { dropFromHms(ns, tbl); return null; })
+            .onFailure(err -> LOG.error("Unexpected error in HMS drop worker ({}.{})", ns, tbl, err));
       }
       default -> {}
     }
@@ -159,7 +184,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
     }
     TSocket transport = null;
     try {
-      transport = new TSocket(hmsHost, hmsPort);
+      transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
       transport.open();
       ThriftHiveMetastore.Client client =
           new ThriftHiveMetastore.Client(new TBinaryProtocol(transport));
@@ -237,7 +262,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   private void dropFromHms(String namespace, String tableName) {
     TSocket transport = null;
     try {
-      transport = new TSocket(hmsHost, hmsPort);
+      transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
       transport.open();
       ThriftHiveMetastore.Client client =
           new ThriftHiveMetastore.Client(new TBinaryProtocol(transport));

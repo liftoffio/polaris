@@ -15,13 +15,17 @@
  */
 package org.apache.polaris.service.events.listeners;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.smallrye.common.annotation.Identifier;
 import io.vertx.core.Vertx;
+import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -50,12 +54,27 @@ import org.slf4j.LoggerFactory;
  * {@code ignore-principal} (default: {@code hms-sync}) are skipped — those
  * come from the HMS→Polaris forward sync listener and would otherwise cause
  * an infinite loop.
+ *
+ * <p>Metrics (Micrometer Prometheus):
+ * <ul>
+ *   <li>{@code polaris_hms_sync_events_total{operation}} — events dispatched to HMS worker
+ *   <li>{@code polaris_hms_sync_skipped_total{reason}} — events skipped before HMS call
+ *   <li>{@code polaris_hms_sync_successes_total{operation}} — HMS calls that completed without error
+ *   <li>{@code polaris_hms_sync_errors_total{operation}} — HMS calls that threw an exception
+ *   <li>{@code polaris_hms_sync_duration_seconds{operation}} — HMS call latency
+ * </ul>
  */
 @ApplicationScoped
 @Identifier("hms-reverse-sync")
 public class HmsReverseSyncEventListener implements PolarisEventListener {
 
   private static final Logger LOG = LoggerFactory.getLogger(HmsReverseSyncEventListener.class);
+
+  private static final String METRIC_EVENTS = "polaris.hms.sync.events";
+  private static final String METRIC_SKIPPED = "polaris.hms.sync.skipped";
+  private static final String METRIC_SUCCESSES = "polaris.hms.sync.successes";
+  private static final String METRIC_ERRORS = "polaris.hms.sync.errors";
+  private static final String METRIC_DURATION = "polaris.hms.sync.duration";
 
   @Inject
   @ConfigProperty(name = "polaris.hms-reverse-sync.enabled", defaultValue = "false")
@@ -94,12 +113,33 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   @Inject
   Vertx vertx;
 
+  @Inject
+  MeterRegistry meterRegistry;
+
+  @PostConstruct
+  void initMetrics() {
+    // Pre-register at zero so all time-series appear in Prometheus on startup
+    for (String op : List.of("create_table", "register_table", "update_table", "drop_table")) {
+      meterRegistry.counter(METRIC_EVENTS, "operation", op);
+      meterRegistry.counter(METRIC_SUCCESSES, "operation", op);
+      meterRegistry.counter(METRIC_ERRORS, "operation", op);
+      meterRegistry.timer(METRIC_DURATION, "operation", op);
+    }
+    for (String reason : List.of("echo", "propagate_deletes_off", "no_metadata_location")) {
+      meterRegistry.counter(METRIC_SKIPPED, "reason", reason);
+    }
+  }
+
   // ── Event dispatch ───────────────────────────────────────────────────────
 
   @Override
   public void onEvent(PolarisEvent event) {
     String catalogName = event.attributes().get(EventAttributes.CATALOG_NAME).orElse(null);
-    if (!shouldSync(catalogName) || isEchoEvent(event)) return;
+    if (!shouldSync(catalogName)) return;
+    if (isEchoEvent(event)) {
+      meterRegistry.counter(METRIC_SKIPPED, "reason", "echo").increment();
+      return;
+    }
 
     switch (event.type()) {
       case AFTER_CREATE_TABLE -> {
@@ -112,7 +152,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterCreateTable: {}.{} @ {}", ns, tbl, loc);
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false); return null; })
+        meterRegistry.counter(METRIC_EVENTS, "operation", "create_table").increment();
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false, "create_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_REGISTER_TABLE -> {
@@ -127,7 +168,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterRegisterTable (non-echo): {}.{} @ {}", ns, tbl, loc);
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false); return null; })
+        meterRegistry.counter(METRIC_EVENTS, "operation", "register_table").increment();
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false, "register_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_UPDATE_TABLE -> {
@@ -140,7 +182,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
                 .map(HmsReverseSyncEventListener::metadataLocation)
                 .orElse(null);
         LOG.info("onAfterUpdateTable: {}.{} @ {}", ns, tbl, loc);
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, true); return null; })
+        meterRegistry.counter(METRIC_EVENTS, "operation", "update_table").increment();
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, true, "update_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_DROP_TABLE -> {
@@ -149,9 +192,11 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
         if (!propagateDeletes) {
           LOG.warn("Skipping HMS drop for {}.{} — propagate-deletes=false; "
               + "set polaris.hms-reverse-sync.propagate-deletes=true to enable", ns, tbl);
+          meterRegistry.counter(METRIC_SKIPPED, "reason", "propagate_deletes_off").increment();
           return;
         }
         LOG.info("onAfterDropTable: {}.{}", ns, tbl);
+        meterRegistry.counter(METRIC_EVENTS, "operation", "drop_table").increment();
         vertx.executeBlocking(() -> { dropFromHms(ns, tbl); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS drop worker ({}.{})", ns, tbl, err));
       }
@@ -177,11 +222,14 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   // ── HMS Thrift operations ────────────────────────────────────────────────
 
   private void syncToHms(
-      String namespace, String tableName, String metadataLocation, boolean isAlter) {
+      String namespace, String tableName, String metadataLocation, boolean isAlter,
+      String operation) {
     if (metadataLocation == null || metadataLocation.isEmpty()) {
       LOG.warn("Skipping HMS sync for {}.{} — no metadata_location", namespace, tableName);
+      meterRegistry.counter(METRIC_SKIPPED, "reason", "no_metadata_location").increment();
       return;
     }
+    Timer.Sample sample = Timer.start(meterRegistry);
     TSocket transport = null;
     try {
       transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
@@ -207,10 +255,13 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
         }
         ensureDatabaseAndCreateTable(client, namespace, tableName, metadataLocation);
       }
+      meterRegistry.counter(METRIC_SUCCESSES, "operation", operation).increment();
     } catch (Exception e) {
       LOG.error("Failed HMS sync for {}.{}: {}", namespace, tableName, e.getMessage(), e);
+      meterRegistry.counter(METRIC_ERRORS, "operation", operation).increment();
     } finally {
       if (transport != null && transport.isOpen()) transport.close();
+      sample.stop(meterRegistry.timer(METRIC_DURATION, "operation", operation));
     }
   }
 
@@ -260,6 +311,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   }
 
   private void dropFromHms(String namespace, String tableName) {
+    Timer.Sample sample = Timer.start(meterRegistry);
     TSocket transport = null;
     try {
       transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
@@ -268,10 +320,13 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
           new ThriftHiveMetastore.Client(new TBinaryProtocol(transport));
       client.drop_table(namespace, tableName, false);
       LOG.info("HMS drop_table {}.{} OK", namespace, tableName);
+      meterRegistry.counter(METRIC_SUCCESSES, "operation", "drop_table").increment();
     } catch (Exception e) {
       LOG.warn("HMS drop_table {}.{} — {}", namespace, tableName, e.getMessage());
+      meterRegistry.counter(METRIC_ERRORS, "operation", "drop_table").increment();
     } finally {
       if (transport != null && transport.isOpen()) transport.close();
+      sample.stop(meterRegistry.timer(METRIC_DURATION, "operation", "drop_table"));
     }
   }
 

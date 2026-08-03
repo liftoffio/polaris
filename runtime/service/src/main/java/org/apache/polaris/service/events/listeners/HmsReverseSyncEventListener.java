@@ -17,6 +17,7 @@ package org.apache.polaris.service.events.listeners;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.quarkus.runtime.Startup;
 import io.smallrye.common.annotation.Identifier;
 import io.vertx.core.Vertx;
 import jakarta.annotation.PostConstruct;
@@ -64,6 +65,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@code polaris_hms_sync_duration_seconds{operation}} — HMS call latency
  * </ul>
  */
+@Startup
 @ApplicationScoped
 @Identifier("hms-reverse-sync")
 public class HmsReverseSyncEventListener implements PolarisEventListener {

@@ -12,6 +12,7 @@
  *   polaris.hms-reverse-sync.hms-port=9083
  *   polaris.hms-reverse-sync.catalog=liftoff_internal
  *   polaris.hms-reverse-sync.ignore-principal=hms-sync
+ *   polaris.hms-reverse-sync.hms-user=polaris-sync
  */
 package org.apache.polaris.service.events.listeners;
 
@@ -51,10 +52,12 @@ import org.slf4j.LoggerFactory;
  * Polaris INTERNAL catalog back to a Hive Metastore (HMS) via Thrift, so that
  * HMS-based readers see the updated metadata_location.
  *
- * <p>Echo detection: events originating from the configured
- * {@code ignore-principal} (default: {@code hms-sync}) are skipped — those
- * come from the HMS→Polaris forward sync listener and would otherwise cause
- * an infinite loop.
+ * <p>Echo detection runs in both directions. Inbound: events originating from the
+ * configured {@code ignore-principal} (default: {@code hms-sync}) are skipped —
+ * those come from the HMS→Polaris forward sync listener and would otherwise cause
+ * an infinite loop. Outbound: writes to HMS declare themselves via {@code set_ugi}
+ * as {@code hms-user} (default: {@code polaris-sync}) so the forward sync listener
+ * can recognize and skip them.
  *
  * <p>Metrics (Micrometer Prometheus):
  * <ul>
@@ -111,6 +114,14 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   @Inject
   @ConfigProperty(name = "polaris.hms-reverse-sync.hms-timeout-ms", defaultValue = "5000")
   int hmsTimeoutMs;
+
+  // Identity this listener declares to HMS via set_ugi, so the HMS→Polaris forward
+  // sync can recognize its own write-backs and skip them. Must match
+  // polaris.sync.ignore-user in hive-site.xml, and requires
+  // hive.metastore.execute.setugi=true on the metastore.
+  @Inject
+  @ConfigProperty(name = "polaris.hms-reverse-sync.hms-user", defaultValue = "polaris-sync")
+  String hmsUser;
 
   @Inject
   Vertx vertx;
@@ -238,6 +249,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       transport.open();
       ThriftHiveMetastore.Client client =
           new ThriftHiveMetastore.Client(new TBinaryProtocol(transport));
+      client.set_ugi(hmsUser, Collections.emptyList());
 
       if (isAlter) {
         try {
@@ -320,6 +332,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       transport.open();
       ThriftHiveMetastore.Client client =
           new ThriftHiveMetastore.Client(new TBinaryProtocol(transport));
+      client.set_ugi(hmsUser, Collections.emptyList());
       client.drop_table(namespace, tableName, false);
       LOG.info("HMS drop_table {}.{} OK", namespace, tableName);
       meterRegistry.counter(METRIC_SUCCESSES, "operation", "drop_table").increment();

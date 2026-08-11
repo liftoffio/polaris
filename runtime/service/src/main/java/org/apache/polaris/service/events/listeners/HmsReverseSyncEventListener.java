@@ -29,6 +29,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
@@ -188,12 +189,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       case AFTER_UPDATE_TABLE -> {
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
         String tbl = event.attributes().getRequired(EventAttributes.TABLE_NAME);
-        String loc =
-            event
-                .attributes()
-                .get(EventAttributes.LOAD_TABLE_RESPONSE)
-                .map(HmsReverseSyncEventListener::metadataLocation)
-                .orElse(null);
+        String loc = updateMetadataLocation(event);
         LOG.info("onAfterUpdateTable: {}.{} @ {}", ns, tbl, loc);
         meterRegistry.counter(METRIC_EVENTS, "operation", "update_table").increment();
         vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, true, "update_table"); return null; })
@@ -349,5 +345,29 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
     if (response == null) return null;
     TableMetadata meta = response.tableMetadata();
     return meta != null ? meta.metadataFileLocation() : null;
+  }
+
+  /**
+   * Extracts the metadata location from an AFTER_UPDATE_TABLE event.
+   *
+   * <p>Update events carry {@code TABLE_METADATA}, not {@code LOAD_TABLE_RESPONSE} — that
+   * applies both to the single-table updateTable path and to each per-table event
+   * commitTransaction emits. Reading only {@code LOAD_TABLE_RESPONSE} meant every update
+   * resolved to null and was skipped as {@code no_metadata_location}, leaving HMS frozen at
+   * whatever metadata the table was created with while Polaris moved on.
+   *
+   * <p>{@code LOAD_TABLE_RESPONSE} is still consulted as a fallback so the method stays
+   * correct if an emitter attaches it instead.
+   */
+  private static String updateMetadataLocation(PolarisEvent event) {
+    Optional<TableMetadata> metadata = event.attributes().get(EventAttributes.TABLE_METADATA);
+    if (metadata.isPresent()) {
+      return metadata.get().metadataFileLocation();
+    }
+    return event
+        .attributes()
+        .get(EventAttributes.LOAD_TABLE_RESPONSE)
+        .map(HmsReverseSyncEventListener::metadataLocation)
+        .orElse(null);
   }
 }

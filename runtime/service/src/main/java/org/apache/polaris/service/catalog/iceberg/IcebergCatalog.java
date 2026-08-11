@@ -305,8 +305,11 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         "Invalid metadata file location; metadata file location must be absolute and contain a '/': %s",
         metadataFileLocation);
 
-    // Throw an exception if this table already exists in the catalog.
-    if (tableExists(identifier)) {
+    // Throw an exception if this table already exists in the catalog, unless
+    // ALLOW_REGISTER_TABLE_OVERWRITE permits repointing it (see the commit below).
+    boolean tableAlreadyExists = tableExists(identifier);
+    if (tableAlreadyExists
+        && !realmConfig.getConfig(FeatureConfiguration.ALLOW_REGISTER_TABLE_OVERWRITE)) {
       throw alreadyExistsExceptionForTableLikeEntity(
           identifier, PolarisEntitySubType.ICEBERG_TABLE);
     }
@@ -332,7 +335,17 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
 
     InputFile metadataFile = fileIO.newInputFile(metadataFileLocation);
     TableMetadata metadata = TableMetadataParser.read(metadataFile);
-    ops.commit(null, metadata);
+    // A null base asserts the table does not yet exist. When repointing an existing table,
+    // pass its current metadata instead so commit() compare-and-sets: a concurrent change
+    // then fails with CommitFailedException rather than being silently clobbered. The
+    // adopt flag keeps the caller's metadata file, which a non-null base would otherwise
+    // replace with a freshly written one.
+    TableMetadata base = null;
+    if (tableAlreadyExists) {
+      base = ops.current();
+      ((BasePolarisTableOperations) ops).adoptProvidedMetadataOnNextCommit();
+    }
+    ops.commit(base, metadata);
 
     return new BaseTable(ops, fullTableName(name(), identifier), metricsReporter());
   }
@@ -1354,6 +1367,13 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
 
     private FileIO tableFileIO;
 
+    // Set by registerTable when repointing an existing table. Normally a commit writes a
+    // fresh metadata file, and only a create (base == null) adopts the caller's file. A
+    // repoint needs both: adopt the caller's file *and* compare-and-set against the current
+    // metadata, so the two behaviours are decoupled here rather than both keying off
+    // base == null. See ALLOW_REGISTER_TABLE_OVERWRITE.
+    private boolean adoptProvidedMetadata;
+
     BasePolarisTableOperations(
         FileIO defaultFileIO,
         TableIdentifier tableIdentifier,
@@ -1391,6 +1411,18 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         throw e;
       }
       return current();
+    }
+
+    /**
+     * Makes the next commit adopt {@code metadata.metadataFileLocation()} instead of writing a
+     * new metadata file, even when committing against a non-null base.
+     *
+     * <p>Used by registerTable when repointing an existing table: the caller already has a
+     * metadata file written by another catalog, and both catalogs must keep pointing at the
+     * same file. Writing a fresh one here would leave the two metadata lineages divergent.
+     */
+    void adoptProvidedMetadataOnNextCommit() {
+      this.adoptProvidedMetadata = true;
     }
 
     @Override
@@ -1568,7 +1600,8 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
                   PolarisStorageActions.WRITE,
                   PolarisStorageActions.LIST));
 
-      String newLocation = writeNewMetadataIfRequired(base == null, metadata);
+      String newLocation =
+          writeNewMetadataIfRequired(base == null || adoptProvidedMetadata, metadata);
       String oldLocation = base == null ? null : base.metadataFileLocation();
 
       // TODO: Consider using the entity from doRefresh() directly to do the conflict detection

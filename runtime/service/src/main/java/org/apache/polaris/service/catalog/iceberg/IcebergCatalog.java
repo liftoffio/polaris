@@ -341,9 +341,11 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
     // then fails with CommitFailedException rather than being silently clobbered. The
     // adopt flag keeps the caller's metadata file, which a non-null base would otherwise
     // replace with a freshly written one.
-    TableMetadata base = null;
-    if (tableAlreadyExists) {
-      base = ops.current();
+    TableMetadata base = tableAlreadyExists ? ops.current() : null;
+    // current() can return null even though tableExists() just said otherwise, when a
+    // concurrent drop lands in between. Fall through to the create path rather than
+    // comparing lineage against nothing.
+    if (base != null) {
       switch (lineageOf(metadata, base)) {
         case SAME:
           // Already pointing at this file. Idempotent, so return without committing.

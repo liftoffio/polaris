@@ -44,6 +44,7 @@ import org.apache.polaris.service.events.EventAttributes;
 import org.apache.polaris.service.events.PolarisEvent;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
+import org.apache.thrift.transport.TTransportException;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,6 +82,38 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   private static final String METRIC_SUCCESSES = "polaris.hms.sync.successes";
   private static final String METRIC_ERRORS = "polaris.hms.sync.errors";
   private static final String METRIC_DURATION = "polaris.hms.sync.duration";
+  private static final String METRIC_RETRIES = "polaris.hms.sync.retries";
+
+  // A transient HMS blip used to drop the write entirely, which matters more than it
+  // looks: HMS has no compare-and-set, so nothing notices the gap and the table stays
+  // behind until something else happens to write to it.
+  private static final int MAX_HMS_ATTEMPTS = 3;
+  private static final long RETRY_BACKOFF_MS = 250;
+
+  // Serializes reverse syncs per table within this JVM. syncToHms reads the table and
+  // then alters it, and HMS gives no way to make that pair atomic, so two syncs for one
+  // table can both read the same state and then write in either order -- leaving HMS on
+  // the older one. Striped rather than a lock per table to bound memory across a catalog
+  // with thousands of tables; a hash collision costs only brief contention.
+  //
+  // This does nothing across Polaris hosts, since writes to one table can arrive at any
+  // of them. The race is narrowed, not removed, and polaris_hms_sync_check stays the
+  // backstop for drift.
+  private static final int LOCK_STRIPES = 64;
+
+  private final Object[] tableLocks = newLockStripes();
+
+  private static Object[] newLockStripes() {
+    Object[] locks = new Object[LOCK_STRIPES];
+    for (int i = 0; i < LOCK_STRIPES; i++) {
+      locks[i] = new Object();
+    }
+    return locks;
+  }
+
+  private Object lockFor(String namespace, String tableName) {
+    return tableLocks[Math.floorMod((namespace + "." + tableName).hashCode(), LOCK_STRIPES)];
+  }
 
   @Inject
   @ConfigProperty(name = "polaris.hms-reverse-sync.enabled", defaultValue = "false")
@@ -138,6 +171,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       meterRegistry.counter(METRIC_SUCCESSES, "operation", op);
       meterRegistry.counter(METRIC_ERRORS, "operation", op);
       meterRegistry.timer(METRIC_DURATION, "operation", op);
+      meterRegistry.counter(METRIC_RETRIES, "operation", op);
     }
     for (String reason : List.of("echo", "propagate_deletes_off", "no_metadata_location")) {
       meterRegistry.counter(METRIC_SKIPPED, "reason", reason);
@@ -239,6 +273,48 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       return;
     }
     Timer.Sample sample = Timer.start(meterRegistry);
+    try {
+      for (int attempt = 1; attempt <= MAX_HMS_ATTEMPTS; attempt++) {
+        try {
+          // Locked per attempt rather than around the whole loop: holding a stripe
+          // across backoff and a 5s socket timeout would stall every other table
+          // hashing to it.
+          synchronized (lockFor(namespace, tableName)) {
+            attemptSync(namespace, tableName, metadataLocation, isAlter);
+          }
+          meterRegistry.counter(METRIC_SUCCESSES, "operation", operation).increment();
+          return;
+        } catch (TTransportException e) {
+          // Connection refused, socket timeout, HMS restarting: worth another go.
+          // Logical failures fall through to the catch below and are not retried.
+          if (attempt == MAX_HMS_ATTEMPTS) {
+            LOG.error("Failed HMS sync for {}.{} after {} attempts: {}",
+                namespace, tableName, MAX_HMS_ATTEMPTS, e.getMessage(), e);
+            meterRegistry.counter(METRIC_ERRORS, "operation", operation).increment();
+            return;
+          }
+          LOG.warn("HMS sync for {}.{} failed (attempt {}/{}), retrying: {}",
+              namespace, tableName, attempt, MAX_HMS_ATTEMPTS, e.getMessage());
+          meterRegistry.counter(METRIC_RETRIES, "operation", operation).increment();
+          Thread.sleep(RETRY_BACKOFF_MS * attempt);
+        }
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn("Interrupted syncing {}.{} to HMS", namespace, tableName);
+      meterRegistry.counter(METRIC_ERRORS, "operation", operation).increment();
+    } catch (Exception e) {
+      LOG.error("Failed HMS sync for {}.{}: {}", namespace, tableName, e.getMessage(), e);
+      meterRegistry.counter(METRIC_ERRORS, "operation", operation).increment();
+    } finally {
+      sample.stop(meterRegistry.timer(METRIC_DURATION, "operation", operation));
+    }
+  }
+
+  /** One connect-and-write attempt. Callers hold the table's lock and handle retries. */
+  private void attemptSync(
+      String namespace, String tableName, String metadataLocation, boolean isAlter)
+      throws Exception {
     TSocket transport = null;
     try {
       transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
@@ -265,13 +341,8 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
         }
         ensureDatabaseAndCreateTable(client, namespace, tableName, metadataLocation);
       }
-      meterRegistry.counter(METRIC_SUCCESSES, "operation", operation).increment();
-    } catch (Exception e) {
-      LOG.error("Failed HMS sync for {}.{}: {}", namespace, tableName, e.getMessage(), e);
-      meterRegistry.counter(METRIC_ERRORS, "operation", operation).increment();
     } finally {
       if (transport != null && transport.isOpen()) transport.close();
-      sample.stop(meterRegistry.timer(METRIC_DURATION, "operation", operation));
     }
   }
 

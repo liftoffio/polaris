@@ -35,6 +35,7 @@ import jakarta.annotation.Nonnull;
 import jakarta.annotation.Nullable;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.util.Arrays;
@@ -343,11 +344,97 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
     TableMetadata base = null;
     if (tableAlreadyExists) {
       base = ops.current();
+      switch (lineageOf(metadata, base)) {
+        case SAME:
+          // Already pointing at this file. Idempotent, so return without committing.
+          return new BaseTable(ops, fullTableName(name(), identifier), metricsReporter());
+        case ANCESTOR:
+          throw new CommitFailedException(
+              "Cannot repoint table %s to %s: that metadata predates the current %s",
+              identifier, metadata.metadataFileLocation(), base.metadataFileLocation());
+        case UNRELATED:
+          throw new CommitFailedException(
+              "Cannot repoint table %s to %s: no ancestry relationship with the current %s",
+              identifier, metadata.metadataFileLocation(), base.metadataFileLocation());
+        case DESCENDANT:
+        default:
+          break;
+      }
       ((BasePolarisTableOperations) ops).adoptProvidedMetadataOnNextCommit();
     }
     ops.commit(base, metadata);
 
     return new BaseTable(ops, fullTableName(name(), identifier), metricsReporter());
+  }
+
+  /** How an incoming metadata file relates to the one a table currently points at. */
+  private enum Lineage {
+    SAME,
+    DESCENDANT,
+    ANCESTOR,
+    UNRELATED
+  }
+
+  /**
+   * Positions {@code incoming} relative to {@code current} using the metadata log.
+   *
+   * <p>A catalog sync bridge repoints tables from an external metastore, and its requests can
+   * arrive out of order: two writes to one table produce two syncs whose network calls race,
+   * so an older metadata file can turn up after a newer one. Nothing else in the commit path
+   * catches that, since the compare-and-set only compares the table's state before and after
+   * this call, not the age of what is being written. Left unchecked the table silently moves
+   * backwards and stays there until the next write.
+   *
+   * <p>Ancestry is used rather than {@code lastUpdatedMillis} because the timestamp is written
+   * by whichever client produced the file, on its own clock, and clock skew is easily the size
+   * of the race being discriminated. {@code lastSequenceNumber} avoids clocks but does not
+   * advance on metadata-only commits and is always 0 for format-version 1. The metadata log
+   * records genuine ancestry instead of approximating it.
+   *
+   * <p>Bounded by {@code write.metadata.previous-versions-max} (100 by default): an incoming
+   * file more than that many commits ahead will not list the current one, so it reports
+   * UNRELATED. Rejecting is safe — callers retry against the refreshed state.
+   */
+  private static Lineage lineageOf(TableMetadata incoming, TableMetadata current) {
+    String incomingLocation = normalizeLocation(incoming.metadataFileLocation());
+    String currentLocation = normalizeLocation(current.metadataFileLocation());
+    if (incomingLocation != null && incomingLocation.equals(currentLocation)) {
+      return Lineage.SAME;
+    }
+    if (logContains(incoming, currentLocation)) {
+      return Lineage.DESCENDANT;
+    }
+    if (logContains(current, incomingLocation)) {
+      return Lineage.ANCESTOR;
+    }
+    return Lineage.UNRELATED;
+  }
+
+  private static boolean logContains(TableMetadata metadata, String location) {
+    if (location == null) {
+      return false;
+    }
+    return metadata.previousFiles().stream()
+        .map(entry -> normalizeLocation(entry.file()))
+        .anyMatch(location::equals);
+  }
+
+  /**
+   * Normalizes a metadata file location for comparison.
+   *
+   * <p>The same file is spelled inconsistently depending on who wrote the reference —
+   * {@code file:///a/b} and {@code file:/a/b} both occur — so comparing raw strings would
+   * report unrelated lineage for files that are in fact the same.
+   */
+  private static String normalizeLocation(String location) {
+    if (location == null) {
+      return null;
+    }
+    try {
+      return URI.create(location).normalize().toString().replaceFirst(":/{2,}", ":/");
+    } catch (IllegalArgumentException e) {
+      return location;
+    }
   }
 
   @Override

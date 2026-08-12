@@ -35,6 +35,7 @@ import jakarta.annotation.Nonnull;
 import jakarta.annotation.Nullable;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.util.Arrays;
@@ -305,8 +306,11 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         "Invalid metadata file location; metadata file location must be absolute and contain a '/': %s",
         metadataFileLocation);
 
-    // Throw an exception if this table already exists in the catalog.
-    if (tableExists(identifier)) {
+    // Throw an exception if this table already exists in the catalog, unless
+    // ALLOW_REGISTER_TABLE_OVERWRITE permits repointing it (see the commit below).
+    boolean tableAlreadyExists = tableExists(identifier);
+    if (tableAlreadyExists
+        && !realmConfig.getConfig(FeatureConfiguration.ALLOW_REGISTER_TABLE_OVERWRITE)) {
       throw alreadyExistsExceptionForTableLikeEntity(
           identifier, PolarisEntitySubType.ICEBERG_TABLE);
     }
@@ -332,9 +336,105 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
 
     InputFile metadataFile = fileIO.newInputFile(metadataFileLocation);
     TableMetadata metadata = TableMetadataParser.read(metadataFile);
-    ops.commit(null, metadata);
+    // A null base asserts the table does not yet exist. When repointing an existing table,
+    // pass its current metadata instead so commit() compare-and-sets: a concurrent change
+    // then fails with CommitFailedException rather than being silently clobbered. The
+    // adopt flag keeps the caller's metadata file, which a non-null base would otherwise
+    // replace with a freshly written one.
+    TableMetadata base = null;
+    if (tableAlreadyExists) {
+      base = ops.current();
+      switch (lineageOf(metadata, base)) {
+        case SAME:
+          // Already pointing at this file. Idempotent, so return without committing.
+          return new BaseTable(ops, fullTableName(name(), identifier), metricsReporter());
+        case ANCESTOR:
+          throw new CommitFailedException(
+              "Cannot repoint table %s to %s: that metadata predates the current %s",
+              identifier, metadata.metadataFileLocation(), base.metadataFileLocation());
+        case UNRELATED:
+          throw new CommitFailedException(
+              "Cannot repoint table %s to %s: no ancestry relationship with the current %s",
+              identifier, metadata.metadataFileLocation(), base.metadataFileLocation());
+        case DESCENDANT:
+        default:
+          break;
+      }
+      ((BasePolarisTableOperations) ops).adoptProvidedMetadataOnNextCommit();
+    }
+    ops.commit(base, metadata);
 
     return new BaseTable(ops, fullTableName(name(), identifier), metricsReporter());
+  }
+
+  /** How an incoming metadata file relates to the one a table currently points at. */
+  private enum Lineage {
+    SAME,
+    DESCENDANT,
+    ANCESTOR,
+    UNRELATED
+  }
+
+  /**
+   * Positions {@code incoming} relative to {@code current} using the metadata log.
+   *
+   * <p>A catalog sync bridge repoints tables from an external metastore, and its requests can
+   * arrive out of order: two writes to one table produce two syncs whose network calls race,
+   * so an older metadata file can turn up after a newer one. Nothing else in the commit path
+   * catches that, since the compare-and-set only compares the table's state before and after
+   * this call, not the age of what is being written. Left unchecked the table silently moves
+   * backwards and stays there until the next write.
+   *
+   * <p>Ancestry is used rather than {@code lastUpdatedMillis} because the timestamp is written
+   * by whichever client produced the file, on its own clock, and clock skew is easily the size
+   * of the race being discriminated. {@code lastSequenceNumber} avoids clocks but does not
+   * advance on metadata-only commits and is always 0 for format-version 1. The metadata log
+   * records genuine ancestry instead of approximating it.
+   *
+   * <p>Bounded by {@code write.metadata.previous-versions-max} (100 by default): an incoming
+   * file more than that many commits ahead will not list the current one, so it reports
+   * UNRELATED. Rejecting is safe — callers retry against the refreshed state.
+   */
+  private static Lineage lineageOf(TableMetadata incoming, TableMetadata current) {
+    String incomingLocation = normalizeLocation(incoming.metadataFileLocation());
+    String currentLocation = normalizeLocation(current.metadataFileLocation());
+    if (incomingLocation != null && incomingLocation.equals(currentLocation)) {
+      return Lineage.SAME;
+    }
+    if (logContains(incoming, currentLocation)) {
+      return Lineage.DESCENDANT;
+    }
+    if (logContains(current, incomingLocation)) {
+      return Lineage.ANCESTOR;
+    }
+    return Lineage.UNRELATED;
+  }
+
+  private static boolean logContains(TableMetadata metadata, String location) {
+    if (location == null) {
+      return false;
+    }
+    return metadata.previousFiles().stream()
+        .map(entry -> normalizeLocation(entry.file()))
+        .anyMatch(location::equals);
+  }
+
+  /**
+   * Normalizes a metadata file location for comparison.
+   *
+   * <p>The same file is spelled inconsistently depending on who wrote the reference —
+   * {@code file:///a/b} and {@code file:/a/b} both occur — so comparing raw strings would
+   * report unrelated lineage for files that are in fact the same.
+   */
+  private static String normalizeLocation(String location) {
+    if (location == null) {
+      return null;
+    }
+    try {
+      return URI.create(location).normalize().toString().replaceFirst(":/{2,}", ":/");
+    } catch (IllegalArgumentException e) {
+      return location;
+    }
   }
 
   @Override
@@ -1354,6 +1454,13 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
 
     private FileIO tableFileIO;
 
+    // Set by registerTable when repointing an existing table. Normally a commit writes a
+    // fresh metadata file, and only a create (base == null) adopts the caller's file. A
+    // repoint needs both: adopt the caller's file *and* compare-and-set against the current
+    // metadata, so the two behaviours are decoupled here rather than both keying off
+    // base == null. See ALLOW_REGISTER_TABLE_OVERWRITE.
+    private boolean adoptProvidedMetadata;
+
     BasePolarisTableOperations(
         FileIO defaultFileIO,
         TableIdentifier tableIdentifier,
@@ -1391,6 +1498,18 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
         throw e;
       }
       return current();
+    }
+
+    /**
+     * Makes the next commit adopt {@code metadata.metadataFileLocation()} instead of writing a
+     * new metadata file, even when committing against a non-null base.
+     *
+     * <p>Used by registerTable when repointing an existing table: the caller already has a
+     * metadata file written by another catalog, and both catalogs must keep pointing at the
+     * same file. Writing a fresh one here would leave the two metadata lineages divergent.
+     */
+    void adoptProvidedMetadataOnNextCommit() {
+      this.adoptProvidedMetadata = true;
     }
 
     @Override
@@ -1568,7 +1687,8 @@ public class IcebergCatalog extends BaseMetastoreViewCatalog
                   PolarisStorageActions.WRITE,
                   PolarisStorageActions.LIST));
 
-      String newLocation = writeNewMetadataIfRequired(base == null, metadata);
+      String newLocation =
+          writeNewMetadataIfRequired(base == null || adoptProvidedMetadata, metadata);
       String oldLocation = base == null ? null : base.metadataFileLocation();
 
       // TODO: Consider using the entity from doRefresh() directly to do the conflict detection

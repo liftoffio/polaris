@@ -41,6 +41,7 @@ import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.ThriftHiveMetastore;
 import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.hive.HiveSchemaUtil;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.polaris.core.auth.PolarisPrincipal;
 import org.apache.polaris.service.events.EventAttributes;
@@ -444,7 +445,12 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
     serDeInfo.setParameters(Collections.emptyMap());
 
     StorageDescriptor sd = new StorageDescriptor();
-    sd.setCols(new ArrayList<FieldSchema>());
+    // Iceberg's own writer populates HMS columns from the Iceberg schema so that tools
+    // which only speak HMS -- DESCRIBE, BI introspection -- can see something. HMS's copy
+    // is never authoritative; readers resolve the real schema from the metadata file. Use
+    // Iceberg's converter rather than mapping types by hand: a wrong type here is worse
+    // than an absent one, because anything trusting it will plan on it.
+    sd.setCols(HiveSchemaUtil.convert(metadata.schema()));
     sd.setLocation(tableLocation);
     sd.setInputFormat("org.apache.hadoop.mapred.TextInputFormat");
     sd.setOutputFormat("org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat");

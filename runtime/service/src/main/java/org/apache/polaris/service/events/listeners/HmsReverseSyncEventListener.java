@@ -30,14 +30,18 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.ThriftHiveMetastore;
+import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.hive.HiveSchemaUtil;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.polaris.core.auth.PolarisPrincipal;
 import org.apache.polaris.service.events.EventAttributes;
@@ -193,15 +197,11 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       case AFTER_CREATE_TABLE -> {
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
         String tbl = event.attributes().getRequired(EventAttributes.TABLE_NAME);
-        String loc =
-            event
-                .attributes()
-                .get(EventAttributes.LOAD_TABLE_RESPONSE)
-                .map(HmsReverseSyncEventListener::metadataLocation)
-                .orElse(null);
+        TableMetadata meta = tableMetadataOf(event);
+        String loc = meta == null ? null : meta.metadataFileLocation();
         LOG.info("onAfterCreateTable: {}.{} @ {}", ns, tbl, loc);
         meterRegistry.counter(METRIC_EVENTS, "operation", "create_table").increment();
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false, "create_table"); return null; })
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, meta, false, "create_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_REGISTER_TABLE -> {
@@ -209,24 +209,21 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
         // echo detection handles that case, but we also sync non-echo registrations.
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
         String tbl = event.attributes().getRequired(EventAttributes.TABLE_NAME);
-        String loc =
-            event
-                .attributes()
-                .get(EventAttributes.LOAD_TABLE_RESPONSE)
-                .map(HmsReverseSyncEventListener::metadataLocation)
-                .orElse(null);
+        TableMetadata meta = tableMetadataOf(event);
+        String loc = meta == null ? null : meta.metadataFileLocation();
         LOG.info("onAfterRegisterTable (non-echo): {}.{} @ {}", ns, tbl, loc);
         meterRegistry.counter(METRIC_EVENTS, "operation", "register_table").increment();
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, false, "register_table"); return null; })
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, meta, false, "register_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_UPDATE_TABLE -> {
         String ns = event.attributes().getRequired(EventAttributes.NAMESPACE).toString();
         String tbl = event.attributes().getRequired(EventAttributes.TABLE_NAME);
-        String loc = updateMetadataLocation(event);
+        TableMetadata meta = tableMetadataOf(event);
+        String loc = meta == null ? null : meta.metadataFileLocation();
         LOG.info("onAfterUpdateTable: {}.{} @ {}", ns, tbl, loc);
         meterRegistry.counter(METRIC_EVENTS, "operation", "update_table").increment();
-        vertx.executeBlocking(() -> { syncToHms(ns, tbl, loc, true, "update_table"); return null; })
+        vertx.executeBlocking(() -> { syncToHms(ns, tbl, meta, true, "update_table"); return null; })
             .onFailure(err -> LOG.error("Unexpected error in HMS sync worker ({}.{})", ns, tbl, err));
       }
       case AFTER_DROP_TABLE -> {
@@ -265,8 +262,9 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
   // ── HMS Thrift operations ────────────────────────────────────────────────
 
   private void syncToHms(
-      String namespace, String tableName, String metadataLocation, boolean isAlter,
+      String namespace, String tableName, TableMetadata metadata, boolean isAlter,
       String operation) {
+    String metadataLocation = metadata == null ? null : metadata.metadataFileLocation();
     if (metadataLocation == null || metadataLocation.isEmpty()) {
       LOG.warn("Skipping HMS sync for {}.{} — no metadata_location", namespace, tableName);
       meterRegistry.counter(METRIC_SKIPPED, "reason", "no_metadata_location").increment();
@@ -280,7 +278,7 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
           // across backoff and a 5s socket timeout would stall every other table
           // hashing to it.
           synchronized (lockFor(namespace, tableName)) {
-            attemptSync(namespace, tableName, metadataLocation, isAlter);
+            attemptSync(namespace, tableName, metadata, isAlter);
           }
           meterRegistry.counter(METRIC_SUCCESSES, "operation", operation).increment();
           return;
@@ -313,8 +311,9 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
 
   /** One connect-and-write attempt. Callers hold the table's lock and handle retries. */
   private void attemptSync(
-      String namespace, String tableName, String metadataLocation, boolean isAlter)
+      String namespace, String tableName, TableMetadata metadata, boolean isAlter)
       throws Exception {
+    String metadataLocation = metadata.metadataFileLocation();
     TSocket transport = null;
     try {
       transport = new TSocket(hmsHost, hmsPort, hmsTimeoutMs);
@@ -326,12 +325,18 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
       if (isAlter) {
         try {
           Table existing = client.get_table(namespace, tableName);
-          existing.getParameters().put("metadata_location", metadataLocation);
-          client.alter_table(namespace, tableName, existing);
+          applyPointerUpdate(existing, metadataLocation);
+          // DO_NOT_UPDATE_STATS stops HMS recomputing numFiles and totalSize, which it
+          // does by listing the storage location -- a directory listing per sync, for
+          // numbers that mean nothing on an Iceberg table. Iceberg's own writer sets it
+          // for the same reason.
+          EnvironmentContext ctx = new EnvironmentContext();
+          ctx.putToProperties(StatsSetupConst.DO_NOT_UPDATE_STATS, "true");
+          client.alter_table_with_environment_context(namespace, tableName, existing, ctx);
           LOG.info("HMS alter_table {}.{} OK", namespace, tableName);
         } catch (NoSuchObjectException e) {
           LOG.info("{}.{} not in HMS, creating instead", namespace, tableName);
-          ensureDatabaseAndCreateTable(client, namespace, tableName, metadataLocation);
+          ensureDatabaseAndCreateTable(client, namespace, tableName, metadata);
         }
       } else {
         // Idempotent: drop first (ignore 404), then create
@@ -339,28 +344,95 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
           client.drop_table(namespace, tableName, false);
         } catch (Exception ignored) {
         }
-        ensureDatabaseAndCreateTable(client, namespace, tableName, metadataLocation);
+        ensureDatabaseAndCreateTable(client, namespace, tableName, metadata);
       }
     } finally {
       if (transport != null && transport.isOpen()) transport.close();
     }
   }
 
+  /**
+   * Extracts the table metadata an event carries, whichever attribute it used.
+   *
+   * <p>Create and register attach {@code LOAD_TABLE_RESPONSE}; update attaches
+   * {@code TABLE_METADATA}, including each per-table event that commitTransaction emits.
+   * Reading only one of the two is how updates came to be silently dropped, so both are
+   * checked here in one place rather than separately in each branch.
+   */
+  private static TableMetadata tableMetadataOf(PolarisEvent event) {
+    Optional<TableMetadata> direct = event.attributes().get(EventAttributes.TABLE_METADATA);
+    if (direct.isPresent()) {
+      return direct.get();
+    }
+    return event
+        .attributes()
+        .get(EventAttributes.LOAD_TABLE_RESPONSE)
+        .map(LoadTableResponse::tableMetadata)
+        .orElse(null);
+  }
+
+  /** Strips the last path segment, used to place a database beside its tables. */
+  private static String parentOf(String location) {
+    if (location == null) {
+      return null;
+    }
+    String trimmed =
+        location.endsWith("/") ? location.substring(0, location.length() - 1) : location;
+    int slash = trimmed.lastIndexOf('/');
+    return slash > 0 ? trimmed.substring(0, slash) : trimmed;
+  }
+
+  /**
+   * Repoints an existing HMS table at new Iceberg metadata.
+   *
+   * <p>Mirrors what {@code HiveTableOperations} writes on a commit, so a synced table is
+   * indistinguishable from one an Iceberg client wrote directly. That reference
+   * implementation is the thing to check against if HMS rows ever look wrong:
+   *
+   * <ul>
+   *   <li>{@code metadata_location} — the new pointer
+   *   <li>{@code previous_metadata_location} — the file just superseded. Without it the row
+   *       is internally inconsistent: the pointer moves while the breadcrumb stays wherever
+   *       it was, which is a state Iceberg would never produce.
+   *   <li>{@code COLUMN_STATS_ACCURATE} removed — a table migrated from Hive can carry this
+   *       from an old ANALYZE, and leaving it in place asserts that stats are accurate for a
+   *       snapshot that no longer exists. Iceberg removes it rather than setting it false.
+   * </ul>
+   *
+   * <p>Deliberately does not maintain {@code numRows} or {@code totalSize}. They are
+   * meaningless for an Iceberg table, whose counts live in the manifests, and no reader
+   * benefits from keeping two systems' idea of them in agreement.
+   */
+  private static void applyPointerUpdate(Table table, String metadataLocation) {
+    Map<String, String> params = table.getParameters();
+    String previous = params.get(BaseMetastoreTableOperations.METADATA_LOCATION_PROP);
+    params.put(BaseMetastoreTableOperations.METADATA_LOCATION_PROP, metadataLocation);
+    if (previous != null && !previous.equals(metadataLocation)) {
+      params.put(BaseMetastoreTableOperations.PREVIOUS_METADATA_LOCATION_PROP, previous);
+    }
+    params.remove(StatsSetupConst.COLUMN_STATS_ACCURATE);
+  }
+
   private void ensureDatabaseAndCreateTable(
       ThriftHiveMetastore.Client client,
       String namespace,
       String tableName,
-      String metadataLocation)
+      TableMetadata metadata)
       throws Exception {
+    String metadataLocation = metadata.metadataFileLocation();
+    String tableLocation = metadata.location();
     try {
       client.get_database(namespace);
     } catch (NoSuchObjectException e) {
       Database db = new Database();
       db.setName(namespace);
-      db.setLocationUri("/tmp/hive/warehouse/" + namespace);
+      // Derived from the table's own location rather than a fixed warehouse path: this
+      // listener has no idea what the deployment's warehouse root is, and a wrong value
+      // here is what HMS hands to anything doing location-based logic.
+      db.setLocationUri(parentOf(tableLocation));
       db.setParameters(Collections.emptyMap());
       client.create_database(db);
-      LOG.info("HMS create_database {} OK", namespace);
+      LOG.info("HMS create_database {} at {} OK", namespace, db.getLocationUri());
     }
 
     Map<String, String> params = new HashMap<>();
@@ -373,8 +445,13 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
     serDeInfo.setParameters(Collections.emptyMap());
 
     StorageDescriptor sd = new StorageDescriptor();
-    sd.setCols(new ArrayList<FieldSchema>());
-    sd.setLocation("/tmp/hive/warehouse/" + namespace + "/" + tableName);
+    // Iceberg's own writer populates HMS columns from the Iceberg schema so that tools
+    // which only speak HMS -- DESCRIBE, BI introspection -- can see something. HMS's copy
+    // is never authoritative; readers resolve the real schema from the metadata file. Use
+    // Iceberg's converter rather than mapping types by hand: a wrong type here is worse
+    // than an absent one, because anything trusting it will plan on it.
+    sd.setCols(HiveSchemaUtil.convert(metadata.schema()));
+    sd.setLocation(tableLocation);
     sd.setInputFormat("org.apache.hadoop.mapred.TextInputFormat");
     sd.setOutputFormat("org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat");
     sd.setSerdeInfo(serDeInfo);
@@ -412,33 +489,5 @@ public class HmsReverseSyncEventListener implements PolarisEventListener {
     }
   }
 
-  private static String metadataLocation(LoadTableResponse response) {
-    if (response == null) return null;
-    TableMetadata meta = response.tableMetadata();
-    return meta != null ? meta.metadataFileLocation() : null;
-  }
 
-  /**
-   * Extracts the metadata location from an AFTER_UPDATE_TABLE event.
-   *
-   * <p>Update events carry {@code TABLE_METADATA}, not {@code LOAD_TABLE_RESPONSE} — that
-   * applies both to the single-table updateTable path and to each per-table event
-   * commitTransaction emits. Reading only {@code LOAD_TABLE_RESPONSE} meant every update
-   * resolved to null and was skipped as {@code no_metadata_location}, leaving HMS frozen at
-   * whatever metadata the table was created with while Polaris moved on.
-   *
-   * <p>{@code LOAD_TABLE_RESPONSE} is still consulted as a fallback so the method stays
-   * correct if an emitter attaches it instead.
-   */
-  private static String updateMetadataLocation(PolarisEvent event) {
-    Optional<TableMetadata> metadata = event.attributes().get(EventAttributes.TABLE_METADATA);
-    if (metadata.isPresent()) {
-      return metadata.get().metadataFileLocation();
-    }
-    return event
-        .attributes()
-        .get(EventAttributes.LOAD_TABLE_RESPONSE)
-        .map(HmsReverseSyncEventListener::metadataLocation)
-        .orElse(null);
-  }
 }

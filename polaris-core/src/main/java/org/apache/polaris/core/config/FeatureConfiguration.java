@@ -236,6 +236,20 @@ public class FeatureConfiguration<T> extends PolarisConfiguration<T> {
           .defaultValue(false)
           .buildFeatureConfiguration();
 
+  public static final FeatureConfiguration<Boolean> ALLOW_REGISTER_TABLE_OVERWRITE =
+      PolarisConfiguration.<Boolean>builder()
+          .key("ALLOW_REGISTER_TABLE_OVERWRITE")
+          .catalogConfig("polaris.config.allow.register.table.overwrite")
+          .description(
+              "If set to true, registerTable may repoint an existing table at a new metadata "
+                  + "file instead of failing with AlreadyExists. The commit still performs a "
+                  + "compare-and-set against the table's current metadata, so a concurrent "
+                  + "change fails rather than being silently overwritten. Intended for catalog "
+                  + "sync bridges mirroring an external metastore, where the alternative is to "
+                  + "drop and re-register the table, briefly exposing it as absent to readers.")
+          .defaultValue(false)
+          .buildFeatureConfiguration();
+
   public static final FeatureConfiguration<List<String>> SUPPORTED_CATALOG_STORAGE_TYPES =
       PolarisConfiguration.<List<String>>builder()
           .key("SUPPORTED_CATALOG_STORAGE_TYPES")

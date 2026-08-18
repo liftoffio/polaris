@@ -51,6 +51,12 @@ dependencies {
   implementation("org.apache.iceberg:iceberg-api")
   implementation("org.apache.iceberg:iceberg-core")
   implementation("org.apache.iceberg:iceberg-aws")
+  // For HiveSchemaUtil, used by the HMS reverse sync to write column metadata the way
+  // Iceberg's own HiveTableOperations does. Hand-rolling the Iceberg-to-Hive type mapping
+  // would risk writing a subtly wrong schema, which is worse than writing none. Adds no
+  // new transitive dependencies -- everything it needs is already here, and it expects
+  // hive-metastore to be provided, which it is below.
+  implementation("org.apache.iceberg:iceberg-hive-metastore")
 
   implementation(platform(libs.quarkus.bom))
   implementation("io.quarkus:quarkus-logging-json")
